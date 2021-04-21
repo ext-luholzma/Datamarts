@@ -1,5 +1,4 @@
-
-CREATE TABLE EXPLOTACION.DM_ORDERS_RECOS
+CREATE OR REPLACE TABLE   EXPLOTACION.DM_ORDERS_RECOS
 CLUSTER BY
  CUS_CUST_ID_SEL
 AS (
@@ -54,8 +53,6 @@ CANCELATIONS_AFECTA_BUYER AS (
     GROUP BY 1,2,3
 ),
 
-
-
 CANCELATIONS_NO_AFECTA_SELLER AS ( 
     SELECT SIT_SITE_ID,CUS_CUST_ID_SEL,ORD_CLOSED_DTTM,
     COUNT (ORD_ORDER_CANCELLATION_REASON_NAME) CANCELACIONES
@@ -71,8 +68,15 @@ CANCELATIONS_NO_AFECTA_BUYER AS (
     where   ORD_ORDER_CANCELLATION_TYPE ='buyer_cancellation'
     AND  date(ORD_CLOSED_DTTM) >= current_date()-30 AND date(ORD_CLOSED_DTTM) <= current_date()
     GROUP BY 1,2,3
+),
+RETURNS AS ( 
+    SELECT SIT_SITE_ID,CUS_CUST_ID_SEL,ORD_CLOSED_DTTM,
+    COUNT (DISTINCT ORD_ORDER_CANCELLATION_TYPE) DEVOLUCIONES
+    FROM `meli-bi-data.DATAMART.DM_ORD_ORDERS_SELLERS` ORDERS
+    Where   ORD_ORDER_CANCELLATION_TYPE ='returns'
+    and date(ORD_CLOSED_DTTM) >= current_date()-30 AND date(ORD_CLOSED_DTTM) <= current_date()
+    group by 1,2,3
 )
-
 
 SELECT SIT_SITE_ID,
     CUS_CUST_ID_SEL,
@@ -82,7 +86,8 @@ SELECT SIT_SITE_ID,
     SUM(SI) SI,
     SUM(ORDENES) ORDENES,
     SUM(RECLAMOS) RECLAMOS,
-    SUM(CANCELACIONES) CANCELACIONES
+    SUM(CANCELACIONES) CANCELACIONES,
+    sum(DEVOLUCIONES) DEVOLUCIONES
   
 FROM (  SELECT  SIT_SITE_ID,
                 CUS_CUST_ID_SEL,
@@ -92,7 +97,8 @@ FROM (  SELECT  SIT_SITE_ID,
                 null as SI,
                 null as ORDENES,
                 RECLAMOS,
-                NULL AS CANCELACIONES
+                null AS CANCELACIONES,
+                null as DEVOLUCIONES
         FROM CLAIMS_AFECTA
         UNION ALL 
 
@@ -104,7 +110,8 @@ FROM (  SELECT  SIT_SITE_ID,
                 null as SI,
                 null as ORDENES,
                 RECLAMOS,
-                NULL AS CANCELACIONES
+                null AS CANCELACIONES,
+                null as DEVOLUCIONES
         FROM CLAIMS_NO_AFECTA
         UNION ALL
 
@@ -115,8 +122,9 @@ FROM (  SELECT  SIT_SITE_ID,
                 GMV,
                 SI,
                 ORDENES,
-                NULL as RECLAMOS,
-                NULL AS CANCELACIONES
+                null as RECLAMOS,
+                null AS CANCELACIONES,
+                null as DEVOLUCIONES
         FROM ORDERS
         UNION ALL
 
@@ -127,8 +135,9 @@ FROM (  SELECT  SIT_SITE_ID,
                 null as GMV,
                 null as SI,
                 null as ORDENES,
-                NULL AS RECLAMOS,
-                CANCELACIONES
+                null AS RECLAMOS,
+                CANCELACIONES,
+                null as DEVOLUCIONES
         FROM CANCELATIONS_AFECTA_SELLER
         UNION ALL
 
@@ -139,8 +148,9 @@ FROM (  SELECT  SIT_SITE_ID,
                 null as GMV,
                 null as SI,
                 null as ORDENES,
-                NULL AS RECLAMOS,
-                CANCELACIONES
+                null AS RECLAMOS,
+                CANCELACIONES,
+                null as DEVOLUCIONES
         FROM CANCELATIONS_AFECTA_BUYER
         UNION ALL
 
@@ -151,8 +161,9 @@ FROM (  SELECT  SIT_SITE_ID,
                 null as GMV,
                 null as SI,
                 null as ORDENES,
-                NULL AS RECLAMOS,
-                CANCELACIONES
+                null AS RECLAMOS,
+                CANCELACIONES,
+                null as DEVOLUCIONES
         FROM CANCELATIONS_NO_AFECTA_SELLER
         UNION ALL
 
@@ -163,9 +174,23 @@ FROM (  SELECT  SIT_SITE_ID,
                 null as GMV,
                 null as SI,
                 null as ORDENES,
-                NULL AS RECLAMOS,
-                CANCELACIONES
+                null AS RECLAMOS,
+                CANCELACIONES,
+                null as DEVOLUCIONES
         FROM CANCELATIONS_NO_AFECTA_BUYER
+        UNION ALL
+
+        SELECT SIT_SITE_ID,
+                CUS_CUST_ID_SEL,
+                ORD_CLOSED_DTTM,
+                null as GMV_LC,
+                null as GMV,
+                null as SI,
+                null as ORDENES,
+                null AS RECLAMOS,
+                null as CANCELACIONES,
+                DEVOLUCIONES
+        FROM RETURNS
 
 )
 GROUP BY 1,2,3
