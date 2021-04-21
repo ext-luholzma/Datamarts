@@ -1,0 +1,172 @@
+
+CREATE TABLE EXPLOTACION.DM_ORDERS_RECOS
+CLUSTER BY
+ CUS_CUST_ID_SEL
+AS (
+WITH CLAIMS_AFECTA AS (  
+    SELECT SIT_SITE_ID,CUS_CUST_ID_SEL,ORD_CLOSED_DTTM,
+    COUNT (DISTINCT ORD_ORDER_ID) RECLAMOS
+    FROM `meli-bi-data.DATAMART.DM_ORD_ORDERS_SELLERS`, unnest(ORD_ORDER_REPUTATION_AFFECTED_BY) as Repu
+    where Repu='claims' 
+    AND  date(ORD_CLOSED_DTTM) >= current_date()-30 AND date(ORD_CLOSED_DTTM) <= current_date()
+    and ORD_ORDER_REPUTATION_IS_CONSIDERED_FLG ='true'
+    group by 1,2,3
+),
+CLAIMS_NO_AFECTA AS ( 
+    SELECT SIT_SITE_ID,CUS_CUST_ID_SEL,ORD_CLOSED_DTTM,
+    COUNT (DISTINCT ORD_ORDER_ID) RECLAMOS
+    FROM `meli-bi-data.DATAMART.DM_ORD_ORDERS_SELLERS` ORDERS
+    Where array_length(ORD_ORDER_CLAIMS)>0
+    AND  date(ORD_CLOSED_DTTM) >= current_date()-30 AND date(ORD_CLOSED_DTTM) <= current_date()
+    group by 1,2,3
+),
+ORDERS AS (
+    SELECT SIT_SITE_ID, CUS_CUST_ID_SEL,ORD_CLOSED_DTTM,
+        SUM(ORD_ITEM.QTY * ORD_ITEM.unit_price) AS GMV_LC,
+        SUM(ORD_ITEM.QTY * ORD_ITEM.unit_price * CC_USD_RATIO) AS GMV,
+        SUM(ORD_ITEM.QTY) AS SI,
+        COUNT(DISTINCT ORD_ORDER_ID)  AS ORDENES
+    FROM `meli-bi-data.DATAMART.DM_ORD_ORDERS_SELLERS`
+    WHERE   ORD_CLOSED_DTTM IS NOT NULL
+    AND  date(ORD_CLOSED_DTTM) >= current_date()-30 AND date(ORD_CLOSED_DTTM) <= current_date()
+    GROUP BY 1,2,3
+),
+
+CANCELATIONS_AFECTA_SELLER AS ( 
+    SELECT SIT_SITE_ID,CUS_CUST_ID_SEL,ORD_CLOSED_DTTM,
+    COUNT (DISTINCT ORD_ORDER_CANCELLATION_REASON_NAME) CANCELACIONES
+    FROM `meli-bi-data.DATAMART.DM_ORD_ORDERS_SELLERS`, unnest(ORD_ORDER_REPUTATION_AFFECTED_BY) as Repu
+    where Repu='cancellations' 
+    and ORD_ORDER_CANCELLATION_TYPE ='seller_cancellation'
+    and ORD_ORDER_REPUTATION_IS_CONSIDERED_FLG ='true'
+    AND  date(ORD_CLOSED_DTTM) >= current_date()-30 AND date(ORD_CLOSED_DTTM) <= current_date()
+    GROUP BY 1,2,3
+),
+
+CANCELATIONS_AFECTA_BUYER AS ( 
+    SELECT SIT_SITE_ID,CUS_CUST_ID_SEL,ORD_CLOSED_DTTM,
+    COUNT (DISTINCT ORD_ORDER_CANCELLATION_REASON_NAME) CANCELACIONES
+    FROM `meli-bi-data.DATAMART.DM_ORD_ORDERS_SELLERS`, unnest(ORD_ORDER_REPUTATION_AFFECTED_BY) as Repu
+    where Repu='cancellations' 
+    and ORD_ORDER_CANCELLATION_TYPE ='buyer_cancellation'
+    and ORD_ORDER_REPUTATION_IS_CONSIDERED_FLG ='true'
+    AND  date(ORD_CLOSED_DTTM) >= current_date()-30 AND date(ORD_CLOSED_DTTM) <= current_date()
+    GROUP BY 1,2,3
+),
+
+
+
+CANCELATIONS_NO_AFECTA_SELLER AS ( 
+    SELECT SIT_SITE_ID,CUS_CUST_ID_SEL,ORD_CLOSED_DTTM,
+    COUNT (ORD_ORDER_CANCELLATION_REASON_NAME) CANCELACIONES
+    FROM `meli-bi-data.DATAMART.DM_ORD_ORDERS_SELLERS`
+    where   ORD_ORDER_CANCELLATION_TYPE ='seller_cancellation'
+    AND  date(ORD_CLOSED_DTTM) >= current_date()-30 AND date(ORD_CLOSED_DTTM) <= current_date()
+    GROUP BY 1,2,3
+),
+CANCELATIONS_NO_AFECTA_BUYER AS ( 
+    SELECT SIT_SITE_ID,CUS_CUST_ID_SEL,ORD_CLOSED_DTTM,
+    COUNT (ORD_ORDER_CANCELLATION_REASON_NAME) CANCELACIONES
+    FROM `meli-bi-data.DATAMART.DM_ORD_ORDERS_SELLERS`
+    where   ORD_ORDER_CANCELLATION_TYPE ='buyer_cancellation'
+    AND  date(ORD_CLOSED_DTTM) >= current_date()-30 AND date(ORD_CLOSED_DTTM) <= current_date()
+    GROUP BY 1,2,3
+)
+
+
+SELECT SIT_SITE_ID,
+    CUS_CUST_ID_SEL,
+    ORD_CLOSED_DTTM,
+    SUM(GMV_LC) GMV_LC,
+    SUM(GMV)GMV,
+    SUM(SI) SI,
+    SUM(ORDENES) ORDENES,
+    SUM(RECLAMOS) RECLAMOS,
+    SUM(CANCELACIONES) CANCELACIONES
+  
+FROM (  SELECT  SIT_SITE_ID,
+                CUS_CUST_ID_SEL,
+                ORD_CLOSED_DTTM,
+                null as GMV_LC,
+                null as GMV,
+                null as SI,
+                null as ORDENES,
+                RECLAMOS,
+                NULL AS CANCELACIONES
+        FROM CLAIMS_AFECTA
+        UNION ALL 
+
+        SELECT  SIT_SITE_ID,
+                CUS_CUST_ID_SEL,
+                ORD_CLOSED_DTTM,
+                null as GMV_LC,
+                null as GMV,
+                null as SI,
+                null as ORDENES,
+                RECLAMOS,
+                NULL AS CANCELACIONES
+        FROM CLAIMS_NO_AFECTA
+        UNION ALL
+
+         select SIT_SITE_ID,
+                CUS_CUST_ID_SEL,
+                ORD_CLOSED_DTTM,
+                GMV_LC,
+                GMV,
+                SI,
+                ORDENES,
+                NULL as RECLAMOS,
+                NULL AS CANCELACIONES
+        FROM ORDERS
+        UNION ALL
+
+            SELECT SIT_SITE_ID,
+                CUS_CUST_ID_SEL,
+                ORD_CLOSED_DTTM,
+                null as GMV_LC,
+                null as GMV,
+                null as SI,
+                null as ORDENES,
+                NULL AS RECLAMOS,
+                CANCELACIONES
+        FROM CANCELATIONS_AFECTA_SELLER
+        UNION ALL
+
+        SELECT SIT_SITE_ID,
+                CUS_CUST_ID_SEL,
+                ORD_CLOSED_DTTM,
+                null as GMV_LC,
+                null as GMV,
+                null as SI,
+                null as ORDENES,
+                NULL AS RECLAMOS,
+                CANCELACIONES
+        FROM CANCELATIONS_AFECTA_BUYER
+        UNION ALL
+
+        SELECT SIT_SITE_ID,
+                CUS_CUST_ID_SEL,
+                ORD_CLOSED_DTTM,
+                null as GMV_LC,
+                null as GMV,
+                null as SI,
+                null as ORDENES,
+                NULL AS RECLAMOS,
+                CANCELACIONES
+        FROM CANCELATIONS_NO_AFECTA_SELLER
+        UNION ALL
+
+        SELECT SIT_SITE_ID,
+                CUS_CUST_ID_SEL,
+                ORD_CLOSED_DTTM,
+                null as GMV_LC,
+                null as GMV,
+                null as SI,
+                null as ORDENES,
+                NULL AS RECLAMOS,
+                CANCELACIONES
+        FROM CANCELATIONS_NO_AFECTA_BUYER
+
+)
+GROUP BY 1,2,3
+)
