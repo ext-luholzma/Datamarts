@@ -1,33 +1,1105 @@
- 
-CREATE TABLE EXPLOTACION.DM_SELLERS
-CLUSTER BY
- CUS_CUST_ID_SEL
+CREATE OR REPLACE TABLE EXPLOTACION.DM_SELLERS
+PARTITION BY
+  RANGE_BUCKET(CUST_ID, GENERATE_ARRAY(0, 100000000000, 10000000))
+CLUSTER BY SITE_ID, CUST_ID
 AS (
-WITH ASESORES AS (
-SELECT DISTINCT C.CUS_CUST_ID_SEL,
- SIT_SITE_ID,
- MAX(ASESOR) ASESOR,
- MAX(TIPOFOCO) TIPOFOCO
-FROM
-(
- SELECT DISTINCT CUS_CUST_ID_SEL,
-   MAX(FECHA_DESDE) FECHA_DESDE_MAX
- FROM WHOWNER.LK_SALES_CARTERA_GESTIONADA
- WHERE FECHA_HASTA IS NULL
- GROUP BY 1
-) X
-JOIN WHOWNER.LK_SALES_CARTERA_GESTIONADA C
- ON C.CUS_CUST_ID_SEL = X.CUS_CUST_ID_SEL
-   AND FECHA_DESDE_MAX = FECHA_DESDE
+WITH MERCADO_PAGO AS (
+    SELECT
+        SIT_SITE_ID, 
+        CUS_CUST_ID_BORROWER CUS_CUST_ID,
+        COUNT(CUS_CUST_ID_BORROWER)QTY_MERCHANT,
+        COUNT(CRD_CREDIT_ID) AS N_MERCHANT,
+        SUM(CRD_CREDIT_AMOUNT) CREDIT_AMOUNT_LC,
+        SUM(CRD_CREDIT_AMOUNT_USD)CREDIT_AMOUNT_USD
+    FROM `meli-bi-data.WHOWNER.BT_MP_CREDITS` 
+    WHERE CRD_CREDIT_TYPE='MERCHANT'
+        and SIT_SITE_ID IN ('MLA','MLC','MLB','MLM','MLU','MCO','MPE','MLV')
+    GROUP BY 1,2
+),
+MERCADO_CREDITS AS (
+    SELECT TRIM(SIT_SITE_ID) SIT_SITE_ID, 
+        CUS_CUST_ID_BORROWER CUS_CUST_ID,
+        COUNT (CUS_CUST_ID_BORROWER) CREDITS
+    FROM `meli-bi-data.WHOWNER.BT_MP_CREDITS_PROPOSAL`
+    WHERE CRD_PROP_PURPOSE_ID in ('FUNDING','funding')
+    AND CRD_PROP_STATUS_ID = 'PENDING'
+    GROUP BY 1,2
+),
+DEVOLUCIONES AS (
+    SELECT  SIT_SITE_ID,
+            CUS_CUST_ID_SEL CUS_CUST_ID,
+            min(ORD_ORDER_CANCELLATION_DATE_CREATED_DTTM) AS FIRST_RETURN_DATE,
+            COUNT(DISTINCT case when ORD_ORDER_CANCELLATION_TYPE ='returns'  then ORD_ORDER_ID END) AS RETURN,
+            COUNT(DISTINCT case when ORD_ORDER_CANCELLATION_TYPE ='returns' AND ORD_CLOSED_DT >= current_date()-7 AND ORD_CLOSED_DT < current_date() then ORD_ORDER_ID END) AS RETURNS_LAST_7DAYS,
+            COUNT(DISTINCT case when ORD_ORDER_CANCELLATION_TYPE ='returns' AND ORD_CLOSED_DT >= current_date()-30 AND ORD_CLOSED_DT < current_date() then ORD_ORDER_ID END) AS RETURNS_LAST_30DAYS,
+    FROM `meli-bi-data.DATAMART.DM_ORD_ORDERS_SELLERS`
+    WHERE ORD_ORDER_CANCELLATION_DATE_CREATED_DTTM IS NOT NULL 
+        AND SIT_SITE_ID IN ('MLA','MLC','MLB','MLM','MLU','MCO','MPE','MLV')
+    GROUP BY 1,2
+),
+CAMPAIGNS_TOTAL AS (
+    SELECT  SITE_ID SIT_SITE_ID,
+        CUS_CUST_ID_SEL CUS_CUST_ID,
+        COUNT(DISTINCT ITEM_ID) N_OFFERS
+    FROM `meli-bi-data.EXPLOTACION.DATAMART_MELICAMPAIGNS`
+    WHERE HAD_REBATE=TRUE
+    GROUP BY 1,2
+),
+DOD_LIGHT_TOTAL AS(
+    SELECT SIT_SITE_ID,
+        SELLER_ID CUS_CUST_ID ,
+        COUNT(DISTINCT ITE_ITEM_ID) N_OFFERS
+    FROM `ML.LK_MKP_PROMOTIONS_OFFERS_SUMMARY`
+    group by 1,2
+),
+OFERTAS AS(
+    SELECT SIT_SITE_ID,
+        CUS_CUST_ID,
+        SUM(N_OFFERS)N_OFFERS 
+    FROM (
+        SELECT SIT_SITE_ID,
+            CUS_CUST_ID,
+            N_OFFERS
+        FROM CAMPAIGNS_TOTAL
+        UNION ALL 
+        SELECT SIT_SITE_ID,
+            CUS_CUST_ID,
+            N_OFFERS
+        FROM DOD_LIGHT_TOTAL
+    )
+    group by 1,2
+),
+CAMPAIGNS AS (
+    SELECT SIT_SITE_ID,
+        CUS_CUST_ID,
+        SUM (ELIGIBLE) DISCOUNT_ELIGIBLE,
+        SUM (DISCOUNT_HIST) DISCOUNT_HIST
+    FROM ( 
+    -- ELEGIBLE Y ACTIVO CAMPAIGNS
+    SELECT SIT_SITE_ID,
+        CUS_CUST_ID,
+        TYPE TYPE,
+        SUM(ELIGIBLE)ELIGIBLE,
+        SUM(ACTIVE)ACTIVE,
+        SUM(DISCOUNT_HIST) DISCOUNT_HIST
+    FROM  (
+        SELECT SITE_ID SIT_SITE_ID,
+            CUS_CUST_ID_SEL CUS_CUST_ID,
+            CAMPAIGN_TYPE TYPE,
+            COUNT(DISTINCT CASE WHEN CAMPAIGN_STATUS in ('started','pending') THEN ITEM_ID END) ELIGIBLE,
+            COUNT(DISTINCT CASE WHEN  ELIGIBILITY_STATUS='ACTIVE' THEN ITEM_ID END) ACTIVE,
+            COUNT(DISTINCT CASE WHEN HAD_REBATE THEN ITEM_ID END) DISCOUNT_HIST
+            FROM `meli-bi-data.EXPLOTACION.DATAMART_MELICAMPAIGNS` 
+            GROUP BY  1,2,3
+        ---- DOD elegible
+        UNION ALL 
+        SELECT
+                site_id SIT_SITE_ID,
+                seller_id CUS_CUST_ID,
+                candidate_type TYPE,
+                COUNT(DISTINCT item_id)  ELIGIBLE,
+                0 AS  ACTIVE,
+                0 AS DISCOUNT_HIST
+            FROM
+                `meli-bi-data.ML.BT_DEALS_CANDIDATES`
+            WHERE
+                JSON_EXTRACT_SCALAR(performance, "$.status") = 'active'
+                AND VERSION = (
+                    SELECT
+                        MAX(version) AS VERSION
+                    FROM
+                        `meli-bi-data.ML.BT_DEALS_CANDIDATES`
+                    WHERE
+                        candidate_type = "dod"
+                        AND JSON_EXTRACT_SCALAR(performance, "$.status") = 'active'
+                ) GROUP BY 1,2,3
+
+                 ---- DOD HISTORIC
+                UNION ALL 
+        SELECT
+                site_id SIT_SITE_ID,
+                seller_id CUS_CUST_ID,
+                candidate_type TYPE,
+                0 AS  ELIGIBLE,
+                0 AS  ACTIVE,
+                COUNT(DISTINCT item_id) AS DISCOUNT_HIST
+            FROM
+                `meli-bi-data.ML.BT_DEALS_CANDIDATES`
+                 GROUP BY 1,2,3
+        --LIGHTNING elegible 
+        UNION ALL 
+        SELECT
+                site_id SIT_SITE_ID,
+                seller_id CUS_CUST_ID,
+                candidate_type TYPE,
+                COUNT(DISTINCT item_id)  ELIGIBLE,
+                0 AS  ACTIVE,
+                0 AS DISCOUNT_HIST
+            FROM
+                `meli-bi-data.ML.BT_DEALS_CANDIDATES`
+            WHERE
+                JSON_EXTRACT_SCALAR(performance, "$.status") = 'active'
+                AND VERSION = (
+                    SELECT
+                        MAX(version) AS VERSION
+                    FROM
+                        `meli-bi-data.ML.BT_DEALS_CANDIDATES`
+                    WHERE
+                        candidate_type = "lightning"
+                        AND JSON_EXTRACT_SCALAR(performance, "$.status") = 'active'
+                ) GROUP BY 1,2,3
+                --LIGHTNING HIST 
+        UNION ALL 
+        SELECT
+                site_id SIT_SITE_ID,
+                seller_id CUS_CUST_ID,
+                candidate_type TYPE,
+                0 AS ELIGIBLE,
+                0 AS  ACTIVE,
+                COUNT(DISTINCT item_id) DISCOUNT_HIST
+            FROM
+                `meli-bi-data.ML.BT_DEALS_CANDIDATES`
+                 GROUP BY 1,2,3
+        -- OFERTAS ACTIVAS dod y lightning
+        UNION ALL 
+        SELECT SIT_SITE_ID,
+                CUS_CUST_ID_SEL CUS_CUST_ID,
+                CASE WHEN TAGS='deal_of_the_day' THEN 'dod'
+                WHEN TAGS= 'lightning_deal' THEN 'lightning' END TYPE,
+                0 AS ELIGIBLE,
+                COUNT(DISTINCT ITE_ITEM_ID )AS ACTIVE,
+                0 AS DISCOUNT_HIST
+            FROM `meli-bi-data.WHOWNER.LK_ITE_ITEMS`, UNNEST(ITE_ITEM_TAGS_JSON) AS TAGS
+            WHERE TAGS in ('deal_of_the_day','lightning_deal') 
+            AND IS_TEST = FALSE
+            AND SIT_SITE_ID IN ('MLA','MLC','MLB','MLM','MLU','MCO','MPE','MLV')
+            AND ITE_ITEM_STATUS = 'active'
+            AND ITE_ITEM_BUYING_MODE != 'classified'
+            GROUP BY 1,2,3
+        )
+        GROUP BY 1,2,3
+    )  
+    GROUP BY 1,2
+),
+TIEMPOS_RESPUESTA as (
+    SELECT Q.SIT_SITE_ID,
+       CUS_CUST_ID_SEL CUS_CUST_ID,
+       COUNT(ITE_ITEM_ID) N_QUESTIONS_LL,
+       COUNT(CASE WHEN ANSWER_QUESTION_TEXT IS NOT NULL THEN ITE_ITEM_ID END) N_ANS_QUEST_LL,
+       SUM(CASE WHEN (ANSWER_DT  is not null) THEN (
+           (TIMESTAMP_DIFF(ANSWER_DT, QUESTION_DT,SECOND))/60
+        ) ELSE null END) ART_MIN,
+        COUNT(CASE WHEN DATE (QUESTION_DT)>= current_date()-30 AND DATE(QUESTION_DT)< current_date() THEN Q.CUS_CUST_ID END ) AS QTY_BUYER_QUESTION_L30D,
+        count(CASE WHEN DATE (QUESTION_DT)>= current_date()-30 AND DATE(QUESTION_DT)< current_date AND  SI is not null THEN Q.CUS_CUST_ID END) ORDER_QUESTION_L30D
+    FROM `meli-bi-data.WHOWNER.BT_ITEM_QUESTIONS` Q
+    LEFT JOIN EXPLOTACION.STAGING_DM_SELLERS_ORDERS O
+    ON Q.SIT_SITE_ID=O.SIT_SITE_ID
+    AND Q.CUS_CUST_ID_SEL=O.CUS_CUST_ID
+   -- WHERE DATE (QUESTION_DT)>= current_date()-14 AND DATE(QUESTION_DT)< current_date()
+    GROUP BY 1,2
+),
+PADS AS (
+    SELECT SIT_SITE_ID,
+        cus_cust_id CUS_CUST_ID,
+        ADV_Segmentation ADV_SEGMENTATION,
+        Oportunidad_Hunting,
+        Oportunidad_Upselling,
+        Oportunidad_Integraci__n Oportunidad_Integracion,
+        Oportunidad_WelcomeCall,
+        Oportunidad_Reactivate,
+        Oportunidad_ACOS,
+        ACOS_Reco,
+        matching,
+        Budget,
+        Reco,
+        ACOS_Actual,
+        SUM(CASE WHEN Dia>= current_date()-30 AND Dia< current_date() THEN Revenues_LM END) PADS_INVESTMENT
+    FROM `meli-bi-data.EXPLOTACION.LK_MKPLC_PADS` 
+    GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14
+),
+ITEMS_OOS AS (
+    
+ SELECT C.SITE_ID SIT_SITE_ID, 
+        C.CUST_ID CUS_CUST_ID,
+        COUNT(DISTINCT C.ITE_ITEM_ID) N_ITEMS_FBM_OOS_TOP_ITEM
+ FROM (
+SELECT SITE_ID, 
+        CUST_ID,
+        ITE_ITEM_ID,
+        SAFE_DIVIDE(SUM(GMV_LAST_30DAYS),SUM(SUM(GMV_LAST_30DAYS)) OVER (PARTITION BY CUST_ID)) SHARE
+
+FROM EXPLOTACION.DM_ITEMS 
+    
+    GROUP BY 1,2,3
+    ) C
+JOIN EXPLOTACION.DM_ITEMS I
+    ON C.SITE_ID=I.SITE_ID
+    AND C.CUST_ID=I.CUST_ID
+    AND C.ITE_ITEM_ID=I.ITE_ITEM_ID
+WHERE SHARE>=0.05
+    AND ITE_FBM_OOS =TRUE
+    GROUP BY 1,2
+),
+FLEX_SELLER AS (
+select 
+cast(shp_sender_id as INT) as CUS_CUST_ID,
+SIT_SITE_ID,
+CASE WHEN working_sat = 0 THEN FALSE ELSE TRUE END WORKING_SAT,-- Ofrece Flex sabados
+CASE WHEN working_sun = 0 THEN FALSE ELSE TRUE END WORKING_SUN-- Ofrece Flex domingos
+
+from `meli-bi-data.WHOWNER.LK_SHP_USER_FLEX_PREFERENCES`
+
+where adoption_status in('in', 'pending', 'processing') --Check si tiene flex
+and fecha_hasta is null--Check si tiene flex
+),
+
+Cantidad_Zonas as (
+SELECT
+cast(Pre.shp_sender_id as int) as shp_sender_id,
+Pre.sit_site_id,
+count(distinct(Zon.shp_dest_zone))as Q_Zonas_destino -- # de zonas prendidas
+
+FROM `meli-bi-data.WHOWNER.LK_SHP_USER_FLEX_PREFERENCES` Pre
+left join `meli-bi-data.WHOWNER.LK_SHP_FLEX_SELLER_ZONES` Zon
+    on Pre.shp_sender_id = Zon.shp_sender_id
+where Zon.fecha_hasta is null -- Check Flex
+    and Pre.fecha_hasta is null -- Check Flex
+    and Pre.adoption_status in('in', 'pending', 'processing') -- Check Flex
+    and Zon.shp_zone_covered_flag = 1 -- Flag necesasrio para ver zonas
+GROUP BY 1,2
+),
+ZONAS AS (
+select
+    shp_sender_id CUS_CUST_ID,
+    sit_site_id SIT_SITE_ID,
+    Q_Zonas_destino
+
+from Cantidad_Zonas
+),
+-- INGRESO DE LOS SELLERS DEL MES ANTERIOR. SE COMPARARÁ CON LOS CARGOS POTENCIALES DE AGING
+shipments as (
+    select shp_shipment_id
+    , shp_order_cost
+    , date(date_trunc(shp_date_created_id, MONTH)) as mes
+    , items
+    from WHOWNER.BT_SHP_SHIPMENTS
+    where SHP_PICKING_TYPE_ID = 'fulfillment'
+    and DATE(date_trunc(shp_datetime_created_id, MONTH)) = date_trunc(date_sub(current_date(),INTERVAL 1 MONTH) , MONTH)
+    and shp_type = 'forward'
+    and shp_date_cancelled_id is null
+    AND SHP_SOURCE_ID = 'MELI'
+    AND SHP_STATUS_ID NOT IN ('cancelled'))
+, shipping_items as (
+    select shp_shipment_id
+    , shp_order_cost
+    , mes
+    , flatten_items.*
+    from shipments, shipments.items as flatten_items
+    )
+, seller_income as (
+    select mes
+    , si.shp_sender_id as seller_id
+    , si.sit_site_id
+    , sum(o.ord_paid_amount) as gmv
+    -- , sum(o.ord_paid_amount * o.cc_usd_ratio) as gmv_usd
+    from shipping_items si
+    left join WHOWNER.BT_ORD_ORDERS o on o.sit_site_id = si.sit_site_id and cast(o.ord_order_id as int64) = cast(si.shp_order_id as int64)
+    group by 1,2,3)
+-- DIMENSION VOLUMETRICA POR INVENTORY ID
+, stock_dimension as (select sit_site_id
+    , inventory_id
+    , case when avg(ite_width * ite_length * ite_height) < 1200 then 'SMALL' 
+          when avg(ite_width * ite_length * ite_height) < 30000 then 'MEDUIM'
+          else 'LARGE' end as volume_type
+    from WHOWNER.BT_FBM_STOCK_DIMENSIONS
+    where ite_width_unit = 'cm'
+    and ite_length_unit = 'cm'
+    and ite_height_unit = 'cm'
+    group by 1,2)
+-- PRICING DE AGING OBTENIDO DEL ULTIMO MES EN EL QUE SE COBRO AGING
+, aging_buckets as (select distinct sit_site_id
+    , fbm_chg_range_botttom as range_bottom
+    , case when fbm_chg_range_top = 0 then 999999999 else fbm_chg_range_top - 2 end as range_top
+    , fbm_volume_type
+    , fbm_chg_amount_per_unit
+    from WHOWNER.BT_FBM_AGING_CHARGES
+    where fbm_chg_action = 'TO_CHARGE'
+    and date(date_trunc(fbm_chg_created_date, MONTH)) >= date_trunc(current_date() - INTERVAL 1 MONTH, MONTH)
+    order by 1,2,4,5)
+-- DIA DE CIERRE DE FACTURACION DE LOS SELLERS
+, facturacion_sellers as (select cus_cust_id as seller_id
+    , sit_site_id
+    , DATE(case when pricing_day > extract(day from current_date) then concat(extract(year from current_date),'-',extract(month from current_date),'-',pricing_day)
+            when pricing_day <= extract(day from current_date) then concat(extract(year from current_date),'-',extract(month from current_date),'-',pricing_day) end) as cierre_facturacion
+    , DATE(case when pricing_day > extract(day from current_date) then concat(extract(year from current_date),'-',extract(month from current_date) - 1,'-',pricing_day)
+            when pricing_day <= extract(day from current_date) then concat(extract(year from current_date),'-',extract(month from current_date),'-',pricing_day) end) as cierre_facturacion_anterior
+    , date_diff(current_date, DATE(case when pricing_day > extract(day from current_date) then concat(extract(year from current_date),'-',extract(month from current_date) - 1,'-',pricing_day)
+            when pricing_day <= extract(day from current_date) then concat(extract(year from current_date),'-',extract(month from current_date),'-',pricing_day) end), day) as dias_desde_cierre_anterior
+    from WHOWNER.LK_FBM_CHG_SELLER_DATE_HIST
+    where date_to is null)
+-- PROYECCION DE STOCK AL DIA DE CIERRE DE FACTRACION DEL SELLER. PARA EL TAMAÑO SE TOMA EL VOLUMEN DECLARADO EN INBOUND Y, EN CASO DE QUE NO ESTÉ, SE ASUME TAMAÑO SMALL POR DEFECTO
+, proyeccion as (select cus_cust_id as seller_id
+    , a.inventory_id
+    , a.sit_site_id
+    , fbm_aging_qty
+    , date_diff(cierre_facturacion, fbm_created_date, DAY) as antiguedad_proyectada
+    , coalesce(sd.volume_type, 'SMALL') as volume_type
+    , ab.bucket_aging
+    , case when dias_desde_cierre_anterior > 25 then '25+ dias'
+          when dias_desde_cierre_anterior <= 25 then 'Menos de 25 dias' end as status_mes_facturacion
+    , cierre_facturacion
+    , cierre_facturacion_anterior
+    , dias_desde_cierre_anterior
+    from (select *
+          , case when warehouse_id like 'AR%' then 'MLA'
+                when warehouse_id like 'BR%' then 'MLB'
+                when warehouse_id like 'CL%' then 'MLC'
+                when warehouse_id like 'CO%' then 'MCO'
+                when warehouse_id like 'MX%' then 'MLM' end as sit_site_id
+          from WHOWNER.BT_FBM_STOCK_AGING) a
+    left join stock_dimension sd on a.inventory_id = sd.inventory_id 
+        and sd.sit_site_id = a.sit_site_id
+    left join facturacion_sellers fs on fs.seller_id = a.cus_cust_id and fs.sit_site_id = a.sit_site_id
+    left join (select distinct sit_site_id
+              , range_bottom
+              , range_top 
+              , row_number() over (partition by sit_site_id order by range_bottom) as bucket_aging
+              from aging_buckets
+              group by 1,2,3) ab on date_diff(cierre_facturacion, fbm_created_date, DAY) between ab.range_bottom and ab.range_top and ab.sit_site_id = a.sit_site_id
+    where fbm_inventory_status in ('not supported', 'damaged', 'available'))
+-- CONSOLIDACION DE CARGOS POTENCIALES, QUE LUEGO SE COMPARARÁN CON SUS INGRESOS DEL MES ANTERIOR PARA ESTIMAR CUANTO REPRESENTA EL AGING DE SUS VENTAS
+, cargos_potenciales as (select p.sit_site_id
+    , p.seller_id 
+    , cierre_facturacion
+    , p.inventory_id
+    , i.ite_item_id
+    , cierre_facturacion_anterior
+    , status_mes_facturacion
+    , dias_desde_cierre_anterior
+    , sum(fbm_aging_qty * fbm_chg_amount_per_unit) as cargos_potenciales
+    , max(coalesce(bucket_aging,0)) as oldest_unit_aging_bucket
+    from proyeccion p
+    left join aging_buckets ab on ab.sit_site_id = p.sit_site_id and p.antiguedad_proyectada between ab.range_bottom and ab.range_top and p.volume_type = ab.fbm_volume_type
+    left join WHOWNER.LK_ITE_VAR_INVENTORY i on i.ite_item_inventory_id = p.inventory_id and i.sit_site_id = p.sit_site_id
+    group by 1,2,3,4,5,6,7,8),
+
+cargos_potenciales_final as (select sit_site_id
+    , seller_id
+    , cierre_facturacion
+    , cierre_facturacion_anterior
+    , status_mes_facturacion
+    , dias_desde_cierre_anterior
+    , worst_ite_item_id
+    , sum(cargos_potenciales) as cargos_potenciales 
+    , max(oldest_unit_aging_bucket) as oldest_unit_aging_bucket
+    -- , count(distinct case when cargos_potenciales_inventory > 0 then ite_item_id end) as items_con_aging
+    -- , first_value(ite_item_id IGNORE NULLS) over (partition by seller_id order by cargos_potenciales_inventory desc) as worst_ite_item_id
+    from (select cp.* 
+          , first_value(ite_item_id IGNORE NULLS) over (partition by sit_site_id, seller_id order by cargos_potenciales desc) as worst_ite_item_id
+          from cargos_potenciales cp)
+    where worst_ite_item_id is not null
+    group by 1,2,3,4,5,6,7),
+    
+-- CONSOLIDACION DE INFO Y CLASIFICACION DE LOS SELLERS PARA LA LOGICA DE LAS CARDS
+FINAL_FACTURACION AS (
+select coalesce(cp.seller_id, si.seller_id) as CUS_CUST_ID
+, coalesce(cp.sit_site_id, si.sit_site_id) as SIT_SITE_ID
+, status_mes_facturacion
+, coalesce(cp.cargos_potenciales / nullif(gmv,0),0) AS FBM_RATIO_COSTOS_AGING_GMV
+, cp.oldest_unit_aging_bucket AS FBM_AGING_MAX_BUCKET
+, dias_desde_cierre_anterior AS FBM_FACTURATION_CLOSE_DAYS
+-- , cp.cargos_potenciales
+-- , gmv_local_curr
+-- , cp.cargos_potenciales / nullif(gmv_local_curr,0) as impacto_aging
+-- , cp.oldest_unit_aging_bucket
+, case when coalesce(cp.cargos_potenciales / nullif(gmv,0),0) > 0.05 then 'Tier 1'
+      when cp.oldest_unit_aging_bucket >= 2 then 'Tier 2'
+      when cp.oldest_unit_aging_bucket >= 1 then 'Tier 3'
+      else 'Tier 4' end as clasificacion
+      , worst_ite_item_id
+from cargos_potenciales_final cp
+left join seller_income si on cp.seller_id = si.seller_id and cp.sit_site_id = si.sit_site_id
+),
+SALES_PARNETSHIP AS (
+    select distinct SITE_SELLER,SELLER_ID  
+    FROM `meli-bi-data.WHOWNER.LK_SELLERS_SALES_PARTNERSHIPS`
+),
+
+CALLCENTER AS(
+    
+SELECT CUS_CUST_ID,
+CC_ACCOUNT_NAME,
+CC_CASE_NUMBER,
+CC_SEGMENTATION_SELLER_COMUNICATION,
+CC_LAST_MODIFIED_DT,
+CC_NUMBER_CALL,
+CC_CALL_OBJETIVE
+
+FROM WHOWNER.BT_SELLERS_CALL_CENTER 
+GROUP BY 1,2,3,4,5,6,7
+QUALIFY RANK() OVER (PARTITION BY CUS_CUST_ID ORDER BY CC_CASE_NUMBER DESC, CC_LAST_MODIFIED_DT DESC) = 1
+),
+TOP_VERTICAL AS (
+SELECT SELLERID CUS_CUST_ID,
+VERTICAL AS TOP_VERTICAL
+FROM (
+SELECT O.ORD_SELLER.ID AS SELLERID,D.VERTICAL AS VERTICAL, SUM(o.ORD_ITEM.QTY * o.ORD_ITEM.unit_price) AS TGMV_LC,
+FROM meli-bi-data.WHOWNER.BT_ORD_ORDERS O
+LEFT JOIN meli-bi-data.WHOWNER.LK_DOM_DOMAINS D
+ON CONCAT(O.SIT_SITE_ID,'-',O.DOM_DOMAIN_ID)=D.DOM_DOMAIN_ID
+WHERE date_SUB(CURRENT_DATE(), INTERVAL 31 DAY) < o.ORD_CLOSED_DTTM
+AND o.ORD_GMV_FLG = TRUE
+and o.ORD_TGMV_FLG=TRUE
+GROUP BY 1,2
+QUALIFY RANK() OVER (PARTITION BY SELLERID ORDER BY TGMV_LC, VERTICAL DESC) = 1)
+),
+TOP_AGG1 AS (
+SELECT SELLERID CUS_CUST_ID,
+AGG1 TOP_AGG1
+FROM (
+SELECT O.ORD_SELLER.ID AS SELLERID,d.dom_domain_agg1 AS AGG1, SUM(o.ORD_ITEM.QTY * o.ORD_ITEM.unit_price) AS TGMV_LC,
+FROM meli-bi-data.WHOWNER.BT_ORD_ORDERS O
+LEFT JOIN meli-bi-data.WHOWNER.LK_DOM_DOMAINS D
+ON CONCAT(O.SIT_SITE_ID,'-',O.DOM_DOMAIN_ID)=D.DOM_DOMAIN_ID
+WHERE date_SUB(CURRENT_DATE(), INTERVAL 31 DAY) < o.ORD_CLOSED_DTTM
+AND o.ORD_GMV_FLG = TRUE
+and o.ORD_TGMV_FLG=TRUE
+
+GROUP BY 1,2
+QUALIFY RANK() OVER (PARTITION BY SELLERID ORDER BY TGMV_LC,AGG1 DESC) = 1)
+),
+TOP_AGG2 AS (
+SELECT SELLERID CUS_CUST_ID,
+AGG2 TOP_AGG2
+FROM (
+SELECT O.ORD_SELLER.ID AS SELLERID,d.dom_domain_agg2 AS AGG2, SUM(o.ORD_ITEM.QTY * o.ORD_ITEM.unit_price) AS TGMV_LC,
+FROM meli-bi-data.WHOWNER.BT_ORD_ORDERS O
+LEFT JOIN meli-bi-data.WHOWNER.LK_DOM_DOMAINS D
+ON CONCAT(O.SIT_SITE_ID,'-',O.DOM_DOMAIN_ID)=D.DOM_DOMAIN_ID
+WHERE date_SUB(CURRENT_DATE(), INTERVAL 31 DAY) < o.ORD_CLOSED_DTTM
+AND o.ORD_GMV_FLG = TRUE
+and o.ORD_TGMV_FLG=TRUE
+
+GROUP BY 1,2
+QUALIFY RANK() OVER (PARTITION BY SELLERID ORDER BY TGMV_LC,AGG2 DESC) = 1)
+),
+LIVE_LISTING as (
+select 
+SIT_SITE_ID,
+CUS_CUST_ID_SEL, 
+case when b.DOM_DOMAIN_GROUP is null then 'N/A' else b.DOM_DOMAIN_GROUP END DOM_DOMAIN_GROUP,
+count(ITE_ITEM_ID) AS LL,
+--RANK() OVER(PARTITION BY CUS_CUST_ID_SEL order by LL desc ) AS Max_LL
+from `meli-bi-data.WHOWNER.LK_ITE_ITEMS` a
+join `meli-bi-data.EXPLOTACION.LK_DOMAIN_GROUPS_BQ` b
+ON (SUBSTR(a.ITE_ITEM_DOM_DOMAIN_ID,5) = b.DOM_DOMAIN_ID
+and ITE_ITEM_MARKETPLACE_FLG =  TRUE
+and ITE_ITEM_LL_FLG = TRUE)
+--where SIT_SITE_ID = 'MLA'
+--AND CUS_CUST_ID_SEL = 102335978
+--QUALIFY RANK() OVER(PARTITION BY CUS_CUST_ID_SEL order by LL desc ) = 1
+GROUP BY 1,2,3
+order by 4),
+LIVE_LISTING_FINAL as (
+Select 
+SIT_SITE_ID,
+CUS_CUST_ID_SEL as CUS_CUST_ID, 
+DOM_DOMAIN_GROUP,
+LL,
+Max_LL
+from (
+SELECT 
+SIT_SITE_ID,
+CUS_CUST_ID_SEL, 
+DOM_DOMAIN_GROUP,
+LL,
+RANK() OVER(PARTITION BY CUS_CUST_ID_SEL order by LL desc, DOM_DOMAIN_GROUP asc ) AS Max_LL
+from LIVE_LISTING) 
+where Max_LL = 1
+order by cus_cust_id_sel asc
+),
+FLEX_WHITELIST AS (
+    
+SELECT
+distinct(Whitelist.cus_cust_id) as CUS_CUST_ID
+
+FROM `meli-bi-data.WHOWNER.LK_SHP_WHITELIST_SELLERS_FLEX` as Whitelist
+LEFT JOIN `meli-bi-data.WHOWNER.LK_SHP_USER_FLEX_PREFERENCES` as Pref
+on Whitelist.CUS_CUST_ID = Pref.SHP_SENDER_ID
+
+where Whitelist.FECHA_HASTA is null
+and Pref.FECHA_HASTA is null
+and ((Pref.ADOPTION_STATUS is null) or (Pref.ADOPTION_STATUS = 'out'))
+and shp_event_flag = 'created'
+order by 1
+
+),
+GMV_VERTICAL AS (
+    SELECT O.SIT_SITE_ID ,
+O.ORD_SELLER.ID AS CUS_CUST_ID,
+CAST (SUM(CASE WHEN VERTICAL='ACC' AND  DATE(ORD_CLOSED_DTTM) >= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()THEN (ORD_ITEM.QTY * ORD_ITEM.UNIT_PRICE) END)AS FLOAT64)   AS ACC_GMV_LC_L30D,
+CAST (SUM(CASE WHEN VERTICAL='APP & SPORTS' AND  DATE(ORD_CLOSED_DTTM) >= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()THEN (ORD_ITEM.QTY * ORD_ITEM.UNIT_PRICE) END)AS FLOAT64)   AS APP_SPORTS_GMV_LC_L30D,
+CAST (SUM(CASE WHEN VERTICAL='BEAUTY & HEALTH' AND  DATE(ORD_CLOSED_DTTM) >= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()THEN (ORD_ITEM.QTY * ORD_ITEM.UNIT_PRICE) END)AS FLOAT64)   AS BEAUTY_HEALTH_GMV_LC_L30D,
+CAST (SUM(CASE WHEN VERTICAL='CE' AND  DATE(ORD_CLOSED_DTTM) >= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()THEN (ORD_ITEM.QTY * ORD_ITEM.UNIT_PRICE) END)AS FLOAT64)   AS CE_GMV_LC_L30D,
+CAST (SUM(CASE WHEN VERTICAL='CPG' AND  DATE(ORD_CLOSED_DTTM) >= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()THEN (ORD_ITEM.QTY * ORD_ITEM.UNIT_PRICE) END)AS FLOAT64)   AS CPG_GMV_LC_L30D,
+CAST (SUM(CASE WHEN VERTICAL='ENTERTAINMENT' AND  DATE(ORD_CLOSED_DTTM) >= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()THEN (ORD_ITEM.QTY * ORD_ITEM.UNIT_PRICE) END)AS FLOAT64)   AS ENTERT_GMV_LC_L30D,
+CAST (SUM(CASE WHEN VERTICAL='HOME & INDUSTRY' AND  DATE(ORD_CLOSED_DTTM) >= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()THEN (ORD_ITEM.QTY * ORD_ITEM.UNIT_PRICE) END)AS FLOAT64)   AS HOME_IND_GMV_LC_L30D,
+CAST (SUM(CASE WHEN VERTICAL='OTHERS' AND  DATE(ORD_CLOSED_DTTM) >= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()THEN (ORD_ITEM.QTY * ORD_ITEM.UNIT_PRICE) END)AS FLOAT64)   AS OTHERS_GMV_LC_L30D,
+CAST (SUM(CASE WHEN VERTICAL='TOYS & BABY' AND  DATE(ORD_CLOSED_DTTM) >= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()THEN (ORD_ITEM.QTY * ORD_ITEM.UNIT_PRICE) END)AS FLOAT64)   AS TOYS_GMV_LC_L30D
+FROM meli-bi-data.WHOWNER.BT_ORD_ORDERS O
+LEFT JOIN meli-bi-data.WHOWNER.LK_DOM_DOMAINS D
+ON CONCAT(O.SIT_SITE_ID,'-',O.DOM_DOMAIN_ID)=D.DOM_DOMAIN_ID
+WHERE  o.ORD_TGMV_FLG=TRUE
+GROUP BY 1,2
+),
+SHIPMENTS_TIMES AS(
+select SIT_SITE_ID, 
+        ORD_SELLER.ID CUS_CUST_ID,
+        AVG(shp_handling_time_hours) AS  HANDLING_TIME_L30D
+FROM   `meli-bi-data.WHOWNER.BT_ORD_ORDERS` O 
+left join WHOWNER.LK_SHP_SHIPMENTS_TIMES T 
+ON T.SHP_SHIPMENT_ID=O.ORD_ITEM.SHIPPING.ID
+    WHERE SIT_SITE_ID IN ('MLA','MLC','MLB','MLM','MLU','MCO','MPE','MLV')
+        AND ORD_TGMV_FLG =TRUE
+        group by 1,2
+),
+NPS AS (
+  SELECT
+      ENV.SIT_SITE_ID,
+      ENV.CUS_CUST_ID_SEL AS CUS_CUST_ID,
+      SUM (CASE
+         WHEN RESP.NPS >=9 THEN 1
+         WHEN RESP.NPS=7 or RESP.NPS=8 THEN 0
+         WHEN RESP.NPS <=6 THEN -1
+      END) AS NPS,
+      COUNT (RESP.NPS) TOTAL_ENCUENTAS
+
+FROM WHOWNER.BT_CX_SURVEYS_RESPONSES RESP
+      INNER JOIN WHOWNER.BT_CX_SURVEYS_HIS_CROUPIER as ENV ON
+                 RESP.SURVEY_ID = ENV.SURVEY_ID and
+                 RESP.SEGMENT_ID = ENV.SEGMENT_ID
+      
+WHERE
+ENV.TRANSACTION_TYPE in ('S') and
+ENV.SIT_SITE_ID not in ('MLV') and
+cast(RESP.end_date as date) >=CURRENT_DATE -30 
+GROUP BY 1,2
+),
+CAPACIDAD_FLEX AS (
+    -------------------------------------------------- BASE -------------------------------------------------------
+-------------------------------------------------- BASE -------------------------------------------------------
+WITH BASE  as (
+select
+
+a2.shp_sender_id,
+a2.sit_site_id,
+CAST(a1.EST_DELIVERY_DATE as date) as Fecha_Promesa,
+count(distinct(a2.shp_shipment_id)) as Envios
+
+from  `meli-bi-data.WHOWNER.BT_SHP_SHIPMENTS` a2
+LEFT JOIN `meli-bi-data.WHOWNER.LK_SHP_ORIGINAL_PROMISE` a1
+on (a2.shp_shipment_id = a1.shp_shipment_id)
+    
+where CAST(a1.EST_DELIVERY_DATE as date) between DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+and a2.shp_shipping_mode_id = 'me2'
+and a2.shp_type = 'forward'
+and a2.shp_source_id = 'MELI'
+--and a2.sit_site_id = 'MLU' --------------------------------------------- FIJAR SITE
+and a2.shp_picking_type_id = 'self_service'
+and a2.shp_status_id <> 'pending'
+
+group by 1,2,3
+
+),
+--------------------------------------------------------- CAPACITY -----------------------------------------------
+CAP as (
+SELECT 
+
+a1.shp_sender_id,
+a1.sit_site_id,
+a1.Fecha_Promesa,
+a1.Envios,
+case when a2.shp_capacity = 0 then 10000
+     else a2.shp_capacity
+     end as Real_Capacity,
+case when a2.shp_capacity = 0 then 0
+     when a1.Envios >= a2.shp_capacity then 1
+     else 0
+     end as Capeo
+
+
+
+from BASE a1
+left join `meli-bi-data.WHOWNER.LK_SHP_USER_FLEX_PREFERENCES` a2
+on ((a1.shp_sender_id = a2.shp_sender_id)
+and (Fecha_Promesa >= (cast(a2.LAST_DATE as DATE)))-------- Depende del SITE
+and ((Fecha_Promesa <= a2.fecha_hasta) or (a2.fecha_hasta is null)))
+
+where a2.shp_capacity <> -1
+and a2.SHP_SENDER_SERVICE_TYPE = 'lightweight'
+and a2.ADOPTION_STATUS in('in', 'pending', 'processing')
+
+QUALIFY RANK() OVER (PARTITION BY a1.shp_sender_id, a1.Fecha_Promesa ORDER BY a2.FECHA_DESDE DESC) = 1
+),
+
+--------------------------------------------------------- CAPACITY 2 -----------------------------------------------
+CAP2 as (
+SELECT 
+
+shp_sender_id,
+sit_site_id,
+Fecha_Promesa,
+Envios,
+Real_Capacity,
+Capeo,
+case when ((Fecha_Promesa = DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)) and (Capeo = 1)) then 1
+     else 0
+     end as Capeo_ayer
+
+from CAP
+),
+
+--------------------------------------------------------- CAPACITY 3 -----------------------------------------------
+CAP3 as (
+select
+shp_sender_id,
+sit_site_id,
+sum(Capeo) as Caps,
+sum(Capeo_ayer) as Cap_ayer
+
+from CAP2
+
+group by 1,2
+)
+
+
+--------------------------------------------------------- BAJADA FINAL -----------------------------------------------
+SELECT
+shp_sender_id as CUS_CUST_ID,
+sit_site_id
+
+from CAP3
+
+where Cap_ayer = 1
+and Caps >= 3
+
+order by 2,1
+
+),
+FECHA_ORDEN10 AS(
+    Select SIT_SITE_ID, 
+        CUS_CUST_ID,
+        ORDER_10_DATE 
+        from (
+SELECT SIT_SITE_ID, 
+        ORD_SELLER.ID CUS_CUST_ID,
+        ORD_CLOSED_DTTM  AS ORDER_10_DATE,
+  ROW_NUMBER() OVER ( PARTITION BY ORD_SELLER.ID ORDER BY ORD_CLOSED_DTTM ) AS rownum
+FROM `meli-bi-data.WHOWNER.BT_ORD_ORDERS` 
+where  ORD_TGMV_FLG =TRUE
+)A
+where A.rownum=10
+),
+SUCCESSFULL_LISTINGS_ACTIVE AS(
+    SELECT 
+        O.SIT_SITE_ID, 
+        ORD_SELLER.ID CUS_CUST_ID,
+        COUNT (DISTINCT CASE WHEN ITE_ITEM_STATUS = 'active' AND DATE(ORD_CLOSED_DTTM)>= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date() THEN O.ITE_ITEM_ID END) N_SUCCESSFUL_LISTINGS_ACTIVE_L30D,
+        COUNT (DISTINCT CASE WHEN ITE_ITEM_STATUS = 'active'  THEN O.ITE_ITEM_ID END) N_SUCCESSFUL_LISTINGS_ACTIVE
+
+        FROM  `meli-bi-data.WHOWNER.BT_ORD_ORDERS` O
+        LEFT JOIN `meli-bi-data.WHOWNER.LK_ITE_ITEMS` I
+        ON O.SIT_SITE_ID=I.SIT_SITE_ID
+        AND O.ITE_ITEM_ID=I.ITE_ITEM_ID
+    WHERE O.SIT_SITE_ID IN ('MLA','MLC','MLB','MLM','MLU','MCO','MPE','MLV')
+        AND O.ORD_TGMV_FLG =TRUE
+        AND IS_TEST = FALSE
+        AND ITE_ITEM_BUYING_MODE != 'classified'
+        --AND  DATE(ORD_CLOSED_DTTM)>= current_date()-30 AND DATE(ORD_CLOSED_DTTM)< current_date()
+    GROUP BY 1,2
+),
+SELLER_MIGRATION AS (
+    SELECT 
+  SM.CUS_CUST_ID as CUS_CUST_ID,
+  SM.SIT_SITE_ID as SIT_SITE_ID,
+  SM.SMI_STATE_ID as STATE, -- -> Puede ser "null".
+  SM.SMI_LOGSTIC_TYPE as LOGISTIC_TYPE_TO, 
+  XP.SHP_SEGMENT_SEL as SEGMENT,
+  SM.SMI_STATUS_ID as STATUS_SM,
+  DATE_DIFF (CURRENT_DATE (),CAST (SM.MSI_ACTIVATION_DATE_DTTM AS DATE),DAY) as DAYS_ACTIVE
+FROM `meli-bi-data.WHOWNER.LK_SHP_SELLER_MIGRATION` SM
+INNER JOIN `meli-bi-data.WHOWNER.LK_SHIPPING_EXPERIENCE` XP ON SM.CUS_CUST_ID = XP.CUS_CUST_ID_SEL AND SM.SIT_SITE_ID = XP.SIT_SITE_ID
+WHERE DELETE_FLG = False
+),
+SHIPMENTS_SENDER AS (
+SELECT S.SHP_SENDER_ID as CUS_CUST_ID,
+S.SIT_SITE_ID,
+COUNT (S.SHP_SHIPMENT_ID) AS QTY_FLEX_SHIPMENTS
+FROM `meli-bi-data.WHOWNER.BT_SHP_SHIPMENTS` S
+LEFT JOIN `meli-bi-data.WHOWNER.LK_SHP_USER_FLEX_PREFERENCES` FP on FP.SHP_SENDER_ID = S.SHP_SENDER_ID
+WHERE
+FP.ADOPTION_STATUS = 'in'
+AND S.SHP_PICKING_TYPE_ID = 'self_service'
+AND CAST(FP.activation_date AS DATE) > '2019-01-01' 
 GROUP BY 1,2
 )
-SELECT S.CUS_CUST_ID_SEL,
- S.CUS_NICKNAME SELLER_NICKNAME,
- S.SEGMENTO,
- S.SEGMENTO_SELLER_DETAIL INICIATIVA,
- A.ASESOR
-FROM `meli-bi-data.WHOWNER.LK_MKP_SEGMENTO_SELLERS` S
-LEFT JOIN ASESORES A
- ON S.CUS_CUST_ID_SEL = A.CUS_CUST_ID_SEL
-)
- 
+
+
+
+SELECT S.CUS_CUST_ID CUST_ID,
+    S.SIT_SITE_ID_CUS SITE_ID,
+    S.CUS_LAST_NAME,
+    S.CUS_FIRST_NAME,
+    S.CUS_NICKNAME,
+    CASE WHEN CUS_MP_FLAG=1 THEN TRUE ELSE FALSE END CUS_HAS_MP_FLG,
+    SS.SEGMENTO SELLER_SEGMENT,
+    SS.SEGMENTO_SELLER_DETAIL SELLER_SEGMENT_DETAIL,
+    SS.TIPOFOCO FOCUS_TYPE,
+    CASE WHEN R.REP_CURRENT_LEVEL in ('green_gold','green_silver','green_platinum') then TRUE else FALSE end as IS_MERCADO_LIDER,
+    COALESCE(R.REP_CURRENT_LEVEL,'newbie') SELLER_REPUTATION,
+    CASE WHEN C.KYC_ENTITY_TYPE = 'company' THEN TRUE ELSE FALSE END IS_COMPANY,
+    -- CASE WHEN S.CUS_CUST_EMPRESA IS NOT NULL THEN TRUE ELSE FALSE END IS_COMPANY,
+    O.CUS_FIRST_SELL CUS_FIRST_SALE_DATE,
+    O.DAYS_FIRST_SELL DAYS_FIRST_SALE,
+    COALESCE(O.GMV_LC,0) GMV_LC,
+    COALESCE(O.GMV_LC_LAST_7DAYS,0) GMV_LC_L7D,
+    COALESCE(O.GMV_LC_LAST_30DAYS,0) GMV_LC_L30D,
+    COALESCE(O.GMV,0) GMV,
+    COALESCE(O.GMV_LAST_7DAYS,0) GMV_L7D,
+    COALESCE(O.GMV_LAST_30DAYS,0) GMV_L30D,
+    COALESCE(O.SI,0) SI,
+    COALESCE(O.SI_LAST_7DAYS,0) SI_L7D,
+    COALESCE(O.SI_LAST_30DAYS,0) SI_L30D,
+    COALESCE(SAFE_DIVIDE(O.GMV_LC,O.SI),0) ASP_LC,
+    COALESCE(SAFE_DIVIDE(O.GMV,O.SI),0) ASP_USD,
+    CASE WHEN O.ORDERS>= 1 THEN TRUE ELSE FALSE END AS FIRST_TIME_SELLER,
+    COALESCE(O.REPUTATION_CALCULATED,false)HAS_REP_CALCULATED,
+    COALESCE(O.ORDERS,0)ORDERS, 
+    COALESCE(O.ORDERS_LAST_7DAYS,0) ORDERS_L7D,
+    COALESCE(O.ORDERS_LAST_30DAYS,0) ORDERS_L30D,
+    COALESCE(O.ORDERS_SHIPPED,0) ORDERS_SHIPPED,
+    COALESCE(O.ORDERS_SHIPPED_LAST_7DAYS,0) ORDERS_SHIPPED_L7D,
+    COALESCE(O.ORDERS_SHIPPED_LAST_30DAYS,0) ORDERS_SHIPPED_L30D,
+    D.FIRST_RETURN_DATE FIRST_RETURN_DATE,
+    CASE WHEN D.RETURN >= 1 THEN TRUE ELSE FALSE END HAS_RETURNS,
+    COALESCE(D.RETURNS_LAST_7DAYS,0) RETURNS_L7D,
+    COALESCE(D.RETURNS_LAST_30DAYS,0) RETURNS_L30D,
+    COALESCE(OU.CLAIMS_AFFECTED_REPU_LAST_7DAYS,0) CLA_AFFECT_REP_L7D,
+    COALESCE(OU.CLAIMS_AFFECTED_REPU_LAST_30DAYS,0) CLA_AFFECT_REP_L30D, 
+    COALESCE(OU.CLAIMS_NO_AFFECTED_REPU_LAST_7DAYS,0) CLA_NO_AFFECT_REP_L7D,
+    COALESCE(OU.CLAIMS_NO_AFFECTED_REPU_LAST_30DAYS,0) CLA_NO_AFFECT_REP_L30D,
+    COALESCE(OU.CANCELLATION_AFFECTED_REPU_SELLER_LAST_7DAYS,0) CANCEL_AFFECT_REP_SEL_L7D,
+    COALESCE(OU.CANCELLATION_AFFECTED_REPU_SELLER_LAST_30DAYS,0) CANCEL_AFFECT_REP_SEL_L30D,  
+    COALESCE(OU.CANCELLATION_AFFECTED_REPU_BUYER_LAST_7DAYS,0) CANCEL_AFFECT_REP_BUY_L7D, 
+    COALESCE(OU.CANCELLATION_AFFECTED_REPU_BUYER_LAST_30DAYS,0) CANCEL_AFFECT_REP_BUY_L30D,
+    COALESCE(OU.CANCELLATION_NO_AFFECTED_REPU_SELLER_LAST_7DAYS,0) CANCEL_NO_AFFECT_REP_SEL_L7D,
+    COALESCE(OU.CANCELLATION_NO_AFFECTED_REPU_SELLER_LAST_30DAYS,0) CANCEL_NO_AFFECT_REP_SEL_L30D,
+    COALESCE(OU.CANCELLATION_NO_AFFECTED_REPU_BUYER_LAST_7DAYS,0) CANCEL_NO_AFFECT_REP_BUY_L7D,
+    COALESCE(OU.CANCELLATION_NO_AFFECTED_REPU_BUYER_LAST_30DAYS,0) CANCEL_NO_AFFECT_REP_BUY_L30D,
+    COALESCE(I.N_ITEMS_ME1,0) N_ITEMS_ME1,
+    COALESCE(I.N_ITEMS_ME2,0) N_ITEMS_ME2,
+    COALESCE(I.N_ITEMS_ME,0) N_ITEMS_ME,
+    CAST(COALESCE(SAFE_DIVIDE(I.N_ITEMS_ME,I.LL),0) AS FLOAT64) AS RATIO_ITEMS_ME,
+    CAST (S.CUS_FIRST_PUBLICATION AS DATE) CUS_FIRST_PUBLICATION_DATE,
+    DATE_DIFF(CURRENT_DATE,S.CUS_FIRST_PUBLICATION, DAY) as DAYS_FIRST_PUBLICATION,
+    COALESCE(I.LL,0) LL,
+    COALESCE(I.LL_LAST_7DAYS,0) LL_L7D ,
+    COALESCE(I.LL_LAST_30DAYS,0) LL_L30D,
+    COALESCE(I.LL_NEW_ACTIVE,0)LL_NEW,
+    COALESCE(I.ITEMS_FREE_SHIPPING,0) ITEMS_FREE_SHIPPING,
+    CAST (COALESCE(SAFE_DIVIDE(I.ITEMS_FREE_SHIPPING_AND_ME2,I.N_ITEMS_ME2),0)AS FLOAT64) AS RATIO_FREE_SHIPPING_M2,
+    CAST (COALESCE(SAFE_DIVIDE(I.N_ITEMS_ME2,I.LL),0)AS FLOAT64) AS RATIO_FREE_SHIPPING,
+    COALESCE(I.ITEMS_FULL_ACTIVE,0) ITEMS_FULL_ACTIVE,
+    CAST (COALESCE(SAFE_DIVIDE(I.ITEMS_FULL_ACTIVE,I.N_ITEMS_ME),0)AS FLOAT64)  RATIO_ITEMS_FULL,
+    COALESCE(I.N_PQP,0) N_ITEMS_PQP,
+    CAST (COALESCE(SAFE_DIVIDE(I.N_PQP,I.LL),0)AS FLOAT64) AS RATIO_ITEMS_PQP,
+    COALESCE(I.N_ITEMS_VARIATIONS,0) N_ITEMS_VARIATIONS,
+    COALESCE(I.ITEMS_ELIGIBLE_CATALOG,0) ITEMS_ELIGIBLE_CATALOG,
+    COALESCE(I.ITEMS_ACT_CATALOG,0) ITEMS_ACT_CATALOG,
+    CAST (COALESCE(SAFE_DIVIDE(I.ITEMS_ELIGIBLE_CATALOG, I.ITEMS_ACT_CATALOG + I.ITEMS_ELIGIBLE_CATALOG),0)AS FLOAT64) RATIO_ITEMS_CATALOG,
+    CAST (COALESCE(SAFE_DIVIDE(I.INCOMPLT_TECH_SPECS,I.LL),0)AS FLOAT64) AS RATIO_INCOMPLETE_TECH_SPECS,
+    COALESCE(MP.N_MERCHANT,0) N_MERCHANT_CREDITS,
+    CAST(COALESCE(MP.CREDIT_AMOUNT_LC,0) AS FLOAT64) CREDIT_AMOUNT_LC,
+    CAST(COALESCE(MP.CREDIT_AMOUNT_USD,0)AS FLOAT64) CREDIT_AMOUNT_USD,
+    COALESCE(MP.QTY_MERCHANT,0) QTY_MERCHANT,
+    CASE WHEN MC.CREDITS > 0 THEN TRUE ELSE FALSE END CREDITS_ELIGIBLE,
+    COALESCE(OT.N_OFFERS,0) N_DISCOUNTS,
+--  CAM.DISCOUNTS DISCOUNTS,
+    CAST (COALESCE(R.REP_DELAYED_HT_RATE,0)AS FLOAT64) AS RATIO_DELAYED,
+    CAST (COALESCE(R.REP_CLAIMS_RATE,0)AS FLOAT64) AS RATIO_CLAIMS,
+    CAST (COALESCE(R.REP_SELLER_CANCELLATIONS_RATE,0) AS FLOAT64) AS RATIO_CANCELLATIONS,
+    CASE WHEN T.CUS_CUST_ID IS NOT NULL THEN TRUE ELSE FALSE END SEEN_SELLING_COACH,
+    CASE WHEN I.LL >=1 OR O.ORDERS_LAST_30DAYS >=1 THEN TRUE ELSE FALSE END AS IS_SELLER_FLG,
+    COALESCE(I.FLAG_PREMIUM,0) N_ITEMS_PREMIUM,
+    COALESCE(I.FLAG_CLASSIC,0) N_ITEMS_CLASSIC,
+    COALESCE(I.FLAG_FREE,0) N_ITEMS_FREE,
+    CAST (COALESCE(SAFE_DIVIDE(I.FLAG_PREMIUM,I.LL),0)AS FLOAT64) AS RATIO_ITEMS_PSJ,
+    S.CUS_RU_SINCE_DT CUS_REGISTRATION_DATE,
+    COALESCE(I.N_ITE_NOT_MARKET_PRICE,0) N_ITE_NOT_MARKET_PRICE,
+    COALESCE(I.NOT_FLEX_NOT_FULL,0) NOT_FLEX_NOT_FULL,
+    CAST (COALESCE(SAFE_DIVIDE(I.NOT_FLEX_NOT_FULL,I.LL),0) AS FLOAT64) AS RATIO_NOT_FLEX_NOT_FULL,
+    COALESCE(I.N_ITEMS_DEAL_ACTIVE,0) N_ITEMS_DEAL_ACTIVE,
+    COALESCE(I.N_ITEMS_ME_AVAILABLE,0)N_ITEMS_ME_AVAILABLE,
+    COALESCE (SAFE_DIVIDE(CAST (COALESCE(SAFE_DIVIDE(I.N_ITEMS_ME,I.LL),0) AS FLOAT64),COALESCE(I.N_ITEMS_ME_AVAILABLE,0)),0)RATIO_ITEMS_ME_AVAILABLE,
+    COALESCE(I.INCOMPLT_TECH_SPECS,0)N_INCOMPLETE_TECH_SPECS,
+    COALESCE(TMR.N_QUESTIONS_LL,0) N_QUESTIONS_LL,
+    CAST(COALESCE(SAFE_DIVIDE(TMR.N_QUESTIONS_LL,TMR.N_ANS_QUEST_LL),0) AS FLOAT64) AS RATIO_QUESTIONS_LL,
+    COALESCE(TMR.N_ANS_QUEST_LL,0)N_ANS_QUEST_LL,
+    CAST(COALESCE(SAFE_DIVIDE(TMR.N_ANS_QUEST_LL,TMR.N_QUESTIONS_LL),0) AS FLOAT64) AS RATIO_ANS_QUEST_LL,
+    SAFE_DIVIDE(COALESCE(TMR.ART_MIN,0),COALESCE(TMR.N_ANS_QUEST_LL,0)) ART_MIN,
+    CASE WHEN  FS.CUS_CUST_ID IS NOT NULL THEN TRUE ELSE FALSE END AS HAS_ACTIVE_FLEX,
+    COALESCE(I.N_FLEX_ITEMS,0)N_FLEX_ITEMS,
+    COALESCE(I.N_ITEMS_FLEX_ELIGIBLE,0) N_ITEMS_FLEX_ELIGIBLE,
+    CAST (COALESCE(SAFE_DIVIDE(I.N_ITEMS_FLEX_ELIGIBLE,I.LL),0) AS FLOAT64) AS RATIO_ITEMS_FLEX_ELEGIBLE,
+    CAST (COALESCE(SAFE_DIVIDE(I.N_FLEX_ITEMS,I.N_ITEMS_ME2),0) AS FLOAT64) AS RATIO_FLEX_ITEMS,
+    COALESCE(O.N_FBM_ORDERS,0) N_FBM_ORDERS,
+    COALESCE(F.N_ITEMS_FBM_PAUSED,0)N_ITEMS_FBM_PAUSED,
+    COALESCE(F.N_ITEMS_ELEG_FBM,0) N_ITEMS_FBM_ELIGIBLE,
+    S.CUS_STATE STATE,
+    S.CUS_CITY CITY,
+    S.CUS_ZIP_CODE ZIP_CODE,
+    CASE WHEN STO_STATUS='active' THEN TRUE ELSE FALSE END HAS_ACTIVE_MSHOPS,
+    COALESCE(O.ORDERS_MSHOPS,0) ORDERS_MSHOPS,
+    COALESCE(O.GMV_LC_MSHOPS,0) GMV_LC_MSHOPS,
+    COALESCE(O.GMV_MSHOPS,0) GMV_MSHOPS,
+    PADS.ADV_SEGMENTATION,
+    COALESCE(PADS.PADS_INVESTMENT,0) PADS_INVESTMENT,
+    CASE WHEN PADS.Oportunidad_Hunting=1 THEN TRUE ELSE FALSE END RECO_PADS_HUNTING,
+    CASE WHEN PADS.Oportunidad_Upselling=1 THEN TRUE ELSE FALSE END RECO_PADS_UPSELLING,
+    CASE WHEN PADS.Oportunidad_Integracion=1 THEN TRUE ELSE FALSE END RECO_PADS_INTEGRATION,
+    CASE WHEN PADS.Oportunidad_WelcomeCall=1 THEN TRUE ELSE FALSE END RECO_PADS_WELCOME_CALL,
+    CASE WHEN PADS.Oportunidad_Reactivate=1 THEN TRUE ELSE FALSE END RECO_PADS_REACTIVATE,
+    CASE WHEN PADS.Oportunidad_ACOS=1 THEN TRUE ELSE FALSE END RECO_PADS_ACOS,
+    CASE WHEN PADS.matching=1 THEN TRUE ELSE FALSE END PADS_MATCHING,
+    PADS.Budget PADS_BUDGET_DETAIL,
+    PADS.Reco PADS_BUDGET_RECO_DETAIL,
+    PADS.ACOS_Actual ACOS_ACTUAL,
+    PADS.ACOS_Reco ACOS_RECO,
+    CAST(COALESCE(SAFE_DIVIDE(PADS.PADS_INVESTMENT,O.GMV_LC_LAST_30DAYS),0) AS FLOAT64) AS RATIO_PADS_TGMV,
+    CAST(COALESCE(SAFE_DIVIDE(O.SI_FULL,O.SI_SHIPPED),0) AS FLOAT64) AS SOW_FBM_L30D,
+    COALESCE(I.ITEMS_FREE_SHIPPING_AND_ME2,0) ITEMS_FREE_SHIPPING_AND_ME2,
+    COALESCE(IO.N_ITEMS_FBM_OOS_TOP_ITEM,0) N_ITEMS_FBM_OOS_TOP_ITEM,
+    COALESCE(I.N_ITEMS_150_USD_NO_PSJ,0) N_ITEMS_150_USD_NO_PSJ,
+    COALESCE(SAFE_DIVIDE(I.LL_LAST_30DAYS,I.PUBLICATION_LAST_30DAYS),0) RATIO_PUBLICATION_L30D,
+    COALESCE(SAFE_DIVIDE(I.ITEMS_ACT_CATALOG,I.LL),0) RATIO_ITEMS_CATALOG_LL,
+    COALESCE(I.QTY_VISITS,0)QTY_VISITS,
+    COALESCE(I.QTY_VISITS_LAST_7DAYS,0) QTY_VISITS_LAST_7DAYS,
+    COALESCE(I.QTY_VISITS_LAST_30DAYS,0) QTY_VISITS_LAST_30DAYS,
+    COALESCE(SAFE_DIVIDE(O.ORDERS,QTY_VISITS),0) CONVERTION,
+    COALESCE(SAFE_DIVIDE(O.ORDERS_LAST_7DAYS,QTY_VISITS_LAST_7DAYS),0)CONVERTION_L7D,
+    COALESCE(SAFE_DIVIDE(O.ORDERS_LAST_30DAYS,QTY_VISITS_LAST_30DAYS),0)CONVERTION_L30D,
+    COALESCE(CASE WHEN O.ORDERS=0 THEN I.ITE_ITEM_QUANTITY_AVAILABLE END,0) N_ITEMS_WITHOUT_STOCK_ORDERS,
+    COALESCE(CASE WHEN O.ORDERS_LAST_7DAYS=0 THEN I.ITE_ITEM_QUANTITY_AVAILABLE_L7DAYS END,0) N_ITEMS_WITHOUT_STOCK_ORDERS_L7DAYS,
+    COALESCE(CASE WHEN O.ORDERS_LAST_30DAYS=0 THEN I.ITE_ITEM_QUANTITY_AVAILABLE_L30DAYS END,0) N_ITEMS_WITHOUT_STOCK_ORDERS_L30DAYS,
+    --O.POWER_STATUS POWER_STATUS,
+    CASE WHEN O.ORDERS=0 THEN '0 ventas' 
+    WHEN  O.ORDERS>=1 AND O.ORDERS<=9 THEN '1-9 ventas'
+    WHEN O.ORDERS>=10 AND O.ORDERS<=39 THEN '10-39 ventas'
+    WHEN O.ORDERS>=40 THEN '>=40 ventas' END  HUNTING_STAGE,
+    COALESCE(OU.N_CLAIMS,0)N_CLAIMS,
+    COALESCE(R.REP_3_MTH_DELAYED_HT_TX,0) QTY_DALAYED_SHIPPED,
+    COALESCE(CAM.DISCOUNT_ELIGIBLE,0)DISCOUNT_ELIGIBLE,
+    COALESCE(CAM.DISCOUNT_HIST,0)DISCOUNT_HIST,
+    COALESCE(FS.WORKING_SAT,FALSE) HAS_FLEX_SAT_ACTIVE,
+    COALESCE(FS.WORKING_SUN,FALSE) HAS_FLEX_SUN_ACTIVE,
+    COALESCE(ZON.Q_Zonas_destino,0) N_ZONES_FLEX_ACTIVE,
+    CASE WHEN  SS.SEGMENTO in ('LONG TAIL','TO') AND TRIM(SS.SEGMENTO_SELLER_DETAIL) = 'NO ASESORADO' AND 
+    S.CUS_FIRST_PUBLICATION >='2021-01-01'  THEN TRUE ELSE FALSE END NEW_SELLERS,
+    CAST(COALESCE(FACT.FBM_RATIO_COSTOS_AGING_GMV,0) AS INT64) FBM_RATIO_COSTOS_AGING_GMV,
+    COALESCE(FACT.FBM_AGING_MAX_BUCKET,0)FBM_AGING_MAX_BUCKET,
+    COALESCE(FACT.FBM_FACTURATION_CLOSE_DAYS,0)FBM_FACTURATION_CLOSE_DAYS,
+    COALESCE(I.ITEMS_WINNER_BB)ITEMS_WINNER_BB,
+    COALESCE(I.ITEMS_LOSING_BB) ITEMS_LOSING_BB,
+    COALESCE(SAFE_DIVIDE(I.ITEMS_LOSING_BB,I.ITEMS_ACT_CATALOG),0) RATIO_LOSING_BB,
+    CASE WHEN SC.CLICKS >0 THEN TRUE ELSE FALSE END CLICKED_SELLING_COACH_FLAG,
+    COALESCE(SC.CLICKS,0)QTY_CLICKED_SELLING_COACH,
+    COALESCE(SC.VIEWS,0)QTY_VIEWS_SELLING_COACH,
+    CASE WHEN SP.SELLER_ID IS NOT NULL THEN TRUE ELSE FALSE END SALES_PARTNERSHIPS_FLAG,
+    COALESCE (FACT.worst_ite_item_id,0) AS WORST_ITE_ITEM_ID,
+    CALC.CC_SEGMENTATION_SELLER_COMUNICATION CC_SEGMENTATION_SELLER_COMUNICATION,
+    CAST (CALC.CC_NUMBER_CALL AS INT64) CC_NUMBER_CALL,
+    CALC.CC_CALL_OBJETIVE CC_CALL_OBJETIVE,
+    TV.TOP_VERTICAL,
+    TAGG1.TOP_AGG1,
+    TAGG2.TOP_AGG2,
+    LF.DOM_DOMAIN_GROUP TOP_DOM_MODA,
+    CASE WHEN FW.CUS_CUST_ID IS NOT NULL THEN TRUE ELSE FALSE END NOT_ACTIVE_FLEX_IN_WHITELIST,
+    COALESCE(O.GMV_LC_LAST_180DAYS,0) GMV_LC_L180D,
+    COALESCE(GV.ACC_GMV_LC_L30D,0) ACC_GMV_LC_L30D,
+    COALESCE(GV.APP_SPORTS_GMV_LC_L30D,0) APP_SPORTS_GMV_LC_L30D,
+    COALESCE(GV.BEAUTY_HEALTH_GMV_LC_L30D,0) BEAUTY_HEALTH_GMV_LC_L30D,
+    COALESCE(GV.CE_GMV_LC_L30D,0) CE_GMV_LC_L30D,
+    COALESCE(GV.CPG_GMV_LC_L30D,0) CPG_GMV_LC_L30D,
+    COALESCE(GV.ENTERT_GMV_LC_L30D,0) ENTERT_GMV_LC_L30D,
+    COALESCE(GV.HOME_IND_GMV_LC_L30D,0) HOME_IND_GMV_LC_L30D,
+    COALESCE(GV.OTHERS_GMV_LC_L30D,0) OTHERS_GMV_LC_L30D,
+    COALESCE(GV.TOYS_GMV_LC_L30D,0)TOYS_GMV_LC_L30D,
+    CAST (COALESCE(R.REP_DISPUTES_RATE,0)AS FLOAT64) AS RATIO_DISPUTES,
+    COALESCE(SAFE_DIVIDE(NPS.NPS,TOTAL_ENCUENTAS),0)NPS,
+    COALESCE(O.TGMV_LC_YOY,0) TGMV_LC_YOY,
+    COALESCE(SAFE_DIVIDE(TMR.QTY_BUYER_QUESTION_L30D,TMR.QTY_BUYER_QUESTION_L30D),0) EFECTIVIDAD_RTA_L30D,
+    COALESCE(ST.HANDLING_TIME_L30D,0) HANDLING_TIME_L30D,
+    COALESCE(O.N_SUCCESSFUL_LISTINGS,0) N_SUCCESSFUL_LISTINGS,
+    --CASE WHEN DI.ORDERS >0 THEN DI.ORDERS END N_SUCCESSFUL_LISTINGS_ACTIVOS,
+    COALESCE(O.SHARE_FBM,0) SHARE_FBM,
+    COALESCE(O.SHARE_FLEX,0) SHARE_FLEX,
+    COALESCE(O.SHARE_DS,0)SHARE_DS,
+    COALESCE(O.SHARE_XD,0)SHARE_XD,
+    COALESCE(O.SHARE_OTHER_ME2,0)SHARE_OTHER_ME2,
+    COALESCE(O.SHARE_ME1,0)SHARE_ME1,
+    COALESCE(O.SHARE_PUIS,0)SHARE_PUIS,
+    COALESCE(O.SHARE_OTHER,0) SHARE_OTHER,
+    COALESCE (CASE WHEN CF.CUS_CUST_ID IS NOT NULL  THEN TRUE ELSE FALSE END,FALSE) AS HAS_CAPPED_FLEX_L7D,
+    COALESCE(O.GMV_LAST_180DAYS,0)GMV_LAST_180DAYS,
+    O.SHIPPING_TYPE_WINNER,
+    COALESCE(O.N_SUCCESSFUL_LISTINGS_L30D,0) N_SUCCESSFUL_LISTINGS_L30D,
+    COALESCE(SLA.N_SUCCESSFUL_LISTINGS_ACTIVE_L30D,0) N_SUCCESSFUL_LISTINGS_ACTIVE_L30D,
+    COALESCE(SLA.N_SUCCESSFUL_LISTINGS_ACTIVE,0)N_SUCCESSFUL_LISTINGS_ACTIVE,
+    COALESCE(SAFE_DIVIDE(SLA.N_SUCCESSFUL_LISTINGS_ACTIVE_L30D,I.LL),0)RATIO_SUCCESSFUL_LISTINGS_ACTIVE_L30D,
+    DATE_DIFF(S.CUS_FIRST_PUBLICATION,O.CUS_FIRST_SELL, DAY) as DAYS_FIRST_PUBLICATION_FIRST_SELL,
+    COALESCE(O.TGMV_USD_YOY,0)TGMV_USD_YOY,
+    SM.STATE SMI_STATE_ID,
+    SM.LOGISTIC_TYPE_TO SMI_LOGISTIC_TYPE_TO, 
+    SM.SEGMENT SHP_SEGMENT_SEL,
+    SM.STATUS_SM SMI_STATUS_ID,
+    COALESCE (SM.DAYS_ACTIVE,0)SMI_DAYS_ACTIVE ,
+    cast (FO.ORDER_10_DATE AS DATE) ORDER_10_DATE,
+    COALESCE (SHS.QTY_FLEX_SHIPMENTS,0)QTY_FLEX_SHIPMENTS,
+    COALESCE (O.N_FBM_ORDERS_LAST_90DAYS,0)N_FBM_ORDERS_L90D
+
+
+
+    /*CASE WHEN S.SIT_SITE_ID_CUS ='MLA' AND O.ORDERS>150 AND O.GMV_LC>500000 AND R.REP_CURRENT_LEVEL='green_platinum' AND O.SI_FBM>=0.30 
+    THEN 'TIER 3' 
+    WHEN S.SIT_SITE_ID_CUS ='MLA' AND O.ORDERS>300 AND O.GMV_LC>1000000 AND R.REP_CURRENT_LEVEL='green_platinum' AND O.SI_FBM>=0.50
+    THEN 'TIER 2' 
+    WHEN S.SIT_SITE_ID_CUS ='MLA' AND O.ORDERS>600 AND O.GMV_LC>2000000 AND R.REP_CURRENT_LEVEL='green_platinum' AND O.SI_FBM>=0.70
+    THEN 'TIER 1' 
+    WHEN S.SIT_SITE_ID_CUS ='MLB' AND O.ORDERS>150 AND O.GMV_LC>25000 AND R.REP_CURRENT_LEVEL in ('green_platinum','green_gold','green_silver','green') AND O.SI_FBM>=0.40
+    THEN 'TIER 3'
+    WHEN S.SIT_SITE_ID_CUS ='MLB' AND O.ORDERS>300 AND O.GMV_LC>50000 AND R.REP_CURRENT_LEVEL in ('green_platinum','green_gold','green_silver','green') AND O.SI_FBM>=0.40
+    THEN 'TIER 2'
+    WHEN S.SIT_SITE_ID_CUS ='MLB' AND O.ORDERS>450 AND O.GMV_LC>100000 AND R.REP_CURRENT_LEVEL in ('green_platinum') AND O.SI_FBM>=0.70
+    THEN 'TIER 1'
+    WHEN S.SIT_SITE_ID_CUS ='MLM' AND O.ORDERS>150 AND O.GMV_LC>100000 AND R.REP_CURRENT_LEVEL in ('green_platinum','green_gold','green_silver','green') AND O.SI_FBM>=0.30
+    THEN 'TIER 3'
+    WHEN S.SIT_SITE_ID_CUS ='MLM' AND O.ORDERS>300 AND O.GMV_LC>200000 AND R.REP_CURRENT_LEVEL in ('green_platinum') AND O.SI_FBM>=0.50
+    THEN 'TIER 2'
+    WHEN S.SIT_SITE_ID_CUS ='MLM' AND O.ORDERS>600 AND O.GMV_LC>400000 AND R.REP_CURRENT_LEVEL in ('green_platinum') AND O.SI_FBM>=0.70
+    THEN 'TIER 1'
+    ELSE 'NO SPS' END SALES_PARNETSHIP
+*/
+    --CASE WHEN (CASE WHEN C.KYC_ENTITY_TYPE = 'company' THEN TRUE ELSE FALSE END) IS FALSE AND O.ORDERS_LAST_30DAYS <=50 AND R.REP_CURRENT_LEVEL IS NULL 
+    --THEN 'D' END AS REPU_OFERTA_D
+
+
+FROM `meli-bi-data.WHOWNER.LK_CUS_CUSTOMERS_DATA` S
+LEFT JOIN `meli-bi-data.WHOWNER.LK_MKP_SEGMENTO_SELLERS` SS
+    ON S.SIT_SITE_ID_CUS=TRIM(SS.SIT_SITE_ID)
+        AND S.CUS_CUST_ID=SS.CUS_CUST_ID_SEL
+LEFT JOIN `meli-bi-data.WHOWNER.BT_REP_SELLER_REPUTATION`  R
+    ON S.SIT_SITE_ID_CUS=R.SIT_SITE_ID
+        AND S.CUS_CUST_ID=R.CUS_CUST_ID_SEL
+ LEFT JOIN `meli-bi-data.WHOWNER.LK_KYC_VAULT_USER` C
+    ON S.SIT_SITE_ID_CUS=C.SIT_SITE_ID
+       AND S.CUS_CUST_ID=C.CUS_CUST_ID
+LEFT JOIN MERCADO_PAGO MP
+    ON S.SIT_SITE_ID_CUS=MP.SIT_SITE_ID
+        AND S.CUS_CUST_ID=MP.CUS_CUST_ID
+LEFT JOIN MERCADO_CREDITS MC
+    ON S.SIT_SITE_ID_CUS=MC.SIT_SITE_ID
+        AND S.CUS_CUST_ID=MC.CUS_CUST_ID
+LEFT JOIN EXPLOTACION.STAGING_DM_SELLERS_ORDERS O
+    ON S.SIT_SITE_ID_CUS=O.SIT_SITE_ID
+        AND S.CUS_CUST_ID=O.CUS_CUST_ID
+LEFT JOIN EXPLOTACION.STAGING_DM_SELLERS_ORDERS_UNNEST OU
+    ON S.SIT_SITE_ID_CUS=OU.SIT_SITE_ID
+        AND S.CUS_CUST_ID=OU.CUS_CUST_ID
+LEFT JOIN EXPLOTACION.STAGING_DM_SELLERS_ITEMS I
+    ON S.SIT_SITE_ID_CUS=I.SIT_SITE_ID
+        AND S.CUS_CUST_ID=I.CUS_CUST_ID
+LEFT JOIN `meli-bi-data.WHOWNER.LK_MSH_CUSTOMERS` MS
+    ON S.SIT_SITE_ID_CUS=MS.SIT_SITE_ID
+        AND S.CUS_CUST_ID=MS.CUS_CUST_ID
+LEFT JOIN TIEMPOS_RESPUESTA TMR
+    ON S.SIT_SITE_ID_CUS=TMR.SIT_SITE_ID
+        AND S.CUS_CUST_ID=TMR.CUS_CUST_ID
+LEFT JOIN PADS
+    ON S.SIT_SITE_ID_CUS=TRIM(PADS.SIT_SITE_ID)
+        AND S.CUS_CUST_ID=PADS.CUS_CUST_ID
+LEFT JOIN EXPLOTACION.STAGING_DM_SELLERS_TRACKS T
+    ON S.SIT_SITE_ID_CUS=T.SIT_SITE_ID
+        AND S.CUS_CUST_ID=T.CUS_CUST_ID
+LEFT JOIN EXPLOTACION.STAGING_DM_SELLERS_FBM F
+    ON S.SIT_SITE_ID_CUS=F.SIT_SITE_ID
+        AND S.CUS_CUST_ID=F.CUS_CUST_ID
+LEFT JOIN CAMPAIGNS CAM 
+    ON S.SIT_SITE_ID_CUS = CAM.SIT_SITE_ID
+        AND S.CUS_CUST_ID = CAM.CUS_CUST_ID
+LEFT JOIN DEVOLUCIONES D 
+    ON S.SIT_SITE_ID_CUS = D.SIT_SITE_ID
+        AND S.CUS_CUST_ID = D.CUS_CUST_ID
+LEFT JOIN ITEMS_OOS IO 
+    ON S.SIT_SITE_ID_CUS = IO.SIT_SITE_ID
+        AND S.CUS_CUST_ID = IO.CUS_CUST_ID
+LEFT JOIN OFERTAS OT 
+    ON S.SIT_SITE_ID_CUS = OT.SIT_SITE_ID
+        AND S.CUS_CUST_ID = OT.CUS_CUST_ID
+LEFT JOIN FLEX_SELLER FS 
+    ON S.SIT_SITE_ID_CUS = FS.SIT_SITE_ID
+        AND S.CUS_CUST_ID = FS.CUS_CUST_ID
+LEFT JOIN ZONAS ZON 
+    ON S.SIT_SITE_ID_CUS = ZON.SIT_SITE_ID
+        AND S.CUS_CUST_ID = ZON.CUS_CUST_ID
+LEFT JOIN FINAL_FACTURACION FACT
+    ON S.SIT_SITE_ID_CUS = FACT.SIT_SITE_ID
+        AND S.CUS_CUST_ID = FACT.CUS_CUST_ID
+LEFT JOIN EXPLOTACION.SELLING_COACH_VIEWS_CLICKS SC
+    ON S.SIT_SITE_ID_CUS = SC.SIT_SITE_ID
+        AND S.CUS_CUST_ID = SC.CUS_CUST_ID
+LEFT JOIN SALES_PARNETSHIP SP
+    ON S.SIT_SITE_ID_CUS = SP.SITE_SELLER
+        AND S.CUS_CUST_ID = SP.SELLER_ID   
+LEFT JOIN CALLCENTER CALC
+    ON  S.CUS_CUST_ID = CALC.CUS_CUST_ID   
+LEFT JOIN TOP_VERTICAL TV
+    ON  S.CUS_CUST_ID = TV.CUS_CUST_ID     
+LEFT JOIN TOP_AGG1 TAGG1
+    ON  S.CUS_CUST_ID = TAGG1.CUS_CUST_ID      
+LEFT JOIN TOP_AGG2 TAGG2
+    ON  S.CUS_CUST_ID = TAGG2.CUS_CUST_ID  
+LEFT JOIN LIVE_LISTING_FINAL LF
+    ON S.SIT_SITE_ID_CUS = LF.SIT_SITE_ID
+        AND S.CUS_CUST_ID = LF.CUS_CUST_ID  
+LEFT JOIN  FLEX_WHITELIST FW
+ON  S.CUS_CUST_ID = FW.CUS_CUST_ID
+LEFT JOIN  GMV_VERTICAL GV
+    ON  S.SIT_SITE_ID_CUS = GV.SIT_SITE_ID
+        AND S.CUS_CUST_ID = GV.CUS_CUST_ID
+LEFT JOIN SHIPMENTS_TIMES ST
+    ON  S.SIT_SITE_ID_CUS = ST.SIT_SITE_ID
+        AND S.CUS_CUST_ID = ST.CUS_CUST_ID
+LEFT JOIN NPS NPS 
+    ON  S.SIT_SITE_ID_CUS = NPS.SIT_SITE_ID
+        AND S.CUS_CUST_ID = NPS.CUS_CUST_ID
+LEFT JOIN CAPACIDAD_FLEX CF
+    ON  S.SIT_SITE_ID_CUS = CF.SIT_SITE_ID
+        AND S.CUS_CUST_ID = CF.CUS_CUST_ID
+LEFT JOIN SUCCESSFULL_LISTINGS_ACTIVE SLA
+    ON  S.SIT_SITE_ID_CUS = SLA.SIT_SITE_ID
+        AND S.CUS_CUST_ID = SLA.CUS_CUST_ID
+LEFT JOIN FECHA_ORDEN10 FO 
+    ON  S.SIT_SITE_ID_CUS = FO.SIT_SITE_ID
+        AND S.CUS_CUST_ID = FO.CUS_CUST_ID
+LEFT JOIN SELLER_MIGRATION SM
+    ON  S.SIT_SITE_ID_CUS = SM.SIT_SITE_ID
+        AND S.CUS_CUST_ID = SM.CUS_CUST_ID
+LEFT JOIN SHIPMENTS_SENDER SHS
+    ON  S.SIT_SITE_ID_CUS = SHS.SIT_SITE_ID
+        AND S.CUS_CUST_ID = SHS.CUS_CUST_ID    
+
+WHERE SIT_SITE_ID_CUS IN ('MLA','MLC','MLB','MLM','MLU','MCO','MPE','MLV') 
+    AND CUS_CUST_STATUS = 'active'
+);
+
+
